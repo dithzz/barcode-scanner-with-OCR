@@ -31,8 +31,6 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
   const lastBarcodeRef = useRef<string>('');
   const lastScanTimeRef = useRef<number>(0);
   const ocrIntervalRef = useRef<number | null>(null);
-  const candidateBarcodesRef = useRef<Map<string, { format: string, source: string, count: number, firstSeen: number }>>(new Map());
-  const barcodeSelectionTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     // Get available cameras
@@ -306,122 +304,61 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
     }
   };
 
-  // Unified barcode handler for both ZXing and Quagga - with smart prioritization
+  // INSTANT barcode handler - retail-speed scanning!
   const handleBarcodeDetected = async (barcodeValue: string, barcodeFormat: string, source: string) => {
     const now = Date.now();
     
-    // Skip if this is the same barcode we just processed
-    if (barcodeValue === lastBarcodeRef.current && now - lastScanTimeRef.current < 3000) {
+    // Only skip if EXACT same barcode scanned within 2 seconds
+    if (barcodeValue === lastBarcodeRef.current && now - lastScanTimeRef.current < 2000) {
       return;
     }
     
-    // Add to candidates or update count
-    const existing = candidateBarcodesRef.current.get(barcodeValue);
-    if (existing) {
-      existing.count++;
-    } else {
-      candidateBarcodesRef.current.set(barcodeValue, {
-        format: barcodeFormat,
-        source: source,
-        count: 1,
-        firstSeen: now
-      });
-    }
-    
-    console.log(`${source}: Detected ${barcodeFormat} (len: ${barcodeValue.length}): ${barcodeValue}`);
-    
-    // Clear any existing selection timer
-    if (barcodeSelectionTimerRef.current) {
-      clearTimeout(barcodeSelectionTimerRef.current);
-    }
-    
-    // FAST: Wait only 500ms to collect barcode detections, then pick the best one
-    barcodeSelectionTimerRef.current = window.setTimeout(() => {
-      selectBestBarcode();
-    }, 500);
-  };
-  
-  const selectBestBarcode = async () => {
-    if (candidateBarcodesRef.current.size === 0 || isProcessing) return;
-    
-    let bestBarcode = '';
-    let bestData: any = null;
-    let hasCode128 = false;
-    
-    // First pass: check if we have any Code 128 barcodes
-    for (const [code, data] of candidateBarcodesRef.current.entries()) {
-      if (data.format === 'code_128') {
-        hasCode128 = true;
-        break;
-      }
-    }
-    
-    // Second pass: select best barcode with priority rules
-    for (const [code, data] of candidateBarcodesRef.current.entries()) {
-      // If we have Code 128, IGNORE all non-Code 128 barcodes
-      if (hasCode128 && data.format !== 'code_128') {
-        continue;
-      }
-      
-      // Select if: first barcode OR longer than current best OR same length but more detections
-      if (!bestBarcode || 
-          code.length > bestBarcode.length ||
-          (code.length === bestBarcode.length && data.count > bestData.count)) {
-        bestBarcode = code;
-        bestData = data;
-      }
-    }
-    
-    if (!bestBarcode) return;
-    
-    // Clear candidates
-    candidateBarcodesRef.current.clear();
-    
-    // Update references
-    lastBarcodeRef.current = bestBarcode;
-    lastScanTimeRef.current = Date.now();
-    setIsProcessing(true);
+    // Update immediately
+    lastBarcodeRef.current = barcodeValue;
+    lastScanTimeRef.current = now;
     
     // Show status
-    setDebugInfo(`⚡ ${bestBarcode}`);
+    setDebugInfo(`⚡ ${barcodeValue}`);
     
-    // Take screenshot
+    // Take screenshot for AI
     const screenshot = captureFrame();
     
     if (!screenshot) {
+      // Send barcode immediately without AI
       onScan({
         barcode: {
-          value: bestBarcode,
-          format: bestData.format
+          value: barcodeValue,
+          format: barcodeFormat
         },
         text: ''
       });
-      setIsProcessing(false);
       setDebugInfo('👁️ Ready');
       return;
     }
     
-    // Call AI for text extraction (async)
+    // Send barcode IMMEDIATELY, then get AI text in background
+    onScan({
+      barcode: {
+        value: barcodeValue,
+        format: barcodeFormat
+      },
+      text: ''
+    });
+    
+    // AI text extraction happens async - doesn't block next scan
     extractTextWithAI(screenshot).then(extractedText => {
-      onScan({
-        barcode: {
-          value: bestBarcode,
-          format: bestData.format
-        },
-        text: extractedText || '(No text found)'
-      });
-      setIsProcessing(false);
+      if (extractedText && extractedText.trim()) {
+        // Send updated result with text
+        onScan({
+          barcode: {
+            value: barcodeValue,
+            format: barcodeFormat
+          },
+          text: extractedText
+        });
+      }
       setDebugInfo('👁️ Ready');
-    }).catch(err => {
-      console.error('AI extraction failed:', err);
-      onScan({
-        barcode: {
-          value: bestBarcode,
-          format: bestData.format
-        },
-        text: '(AI extraction failed)'
-      });
-      setIsProcessing(false);
+    }).catch(() => {
       setDebugInfo('👁️ Ready');
     });
   };
@@ -466,11 +403,11 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
         },
         locate: true,
         locator: {
-          patchSize: "x-large",    // Largest patch size for difficult barcodes
-          halfSample: false        // Full resolution
+          patchSize: "medium",       // Medium for speed
+          halfSample: true           // Half sample for SPEED
         },
-        frequency: 30,             // FAST: 30 scans per second for instant detection
-        numOfWorkers: 0,           // Use main thread for better performance
+        frequency: 10,               // 10 per second - balance speed and accuracy
+        numOfWorkers: 0,             // Use main thread
         debug: false
       }, (err) => {
         if (err) {
@@ -486,18 +423,16 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
             const code = result.codeResult.code;
             const format = result.codeResult.format || 'unknown';
             
-            // Very lenient quality check - accept almost everything
+            // Very lenient - accept almost all scans for speed
             const quality = result.codeResult.decodedCodes
-              .filter((code: any) => code.error !== undefined)
-              .reduce((sum: number, code: any) => sum + code.error, 0) / result.codeResult.decodedCodes.length;
+              .filter((c: any) => c.error !== undefined)
+              .reduce((sum: number, c: any) => sum + c.error, 0) / result.codeResult.decodedCodes.length;
             
-            // Only reject extremely poor reads
-            if (quality > 0.35) {
-              console.log(`Quagga: Poor quality rejected (error: ${quality.toFixed(3)})`);
+            // Only reject terrible quality (0.5 = 50% error rate)
+            if (quality > 0.5) {
               return;
             }
             
-            console.log(`Quagga: ✓ Detected ${format} (error: ${quality.toFixed(3)}, len: ${code.length}): ${code}`);
             await handleBarcodeDetected(code, format, 'Quagga');
           }
         });
