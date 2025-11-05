@@ -51,11 +51,10 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
 
       const codeReader = new BrowserMultiFormatReader();
       
-      // Configure for MAXIMUM barcode detection - work with ANY quality
+      // Configure for SPEED - remove TRY_HARDER for instant scanning
       const hints = new Map();
-      hints.set(2, true); // TRY_HARDER mode
+      // Removed TRY_HARDER for speed - sacrifices difficult barcodes for speed
       hints.set(3, true); // PURE_BARCODE (ignore surrounding content)
-      hints.set(4, true); // ASSUME_GS1 (support GS1 barcodes)
       codeReader.hints = hints;
       
       codeReaderRef.current = codeReader;
@@ -101,8 +100,8 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
             
             const now = Date.now();
             
-            // Skip if this is the same barcode we just scanned (within 1 second)
-            if (barcodeValue === lastBarcodeRef.current && now - lastScanTimeRef.current < 1000) {
+            // Skip if this is the same barcode we just scanned (within 300ms)
+            if (barcodeValue === lastBarcodeRef.current && now - lastScanTimeRef.current < 300) {
               return; // Skip immediate duplicates of same barcode
             }
             
@@ -120,7 +119,7 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
             setIsProcessing(true);
             
             // Show status immediately
-            setDebugInfo(`✅ ${barcodeValue} - Extracting text...`);
+            setDebugInfo(`⚡ ${barcodeValue}`);
             
             // Take screenshot
             const screenshot = captureFrame();
@@ -150,14 +149,9 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
                 text: extractedText || '(No text found)'
               });
               
-              setDebugInfo('✨ Complete!');
-              
-              // Reset processing flag immediately
+              // Reset processing flag immediately for next scan
               setIsProcessing(false);
-              
-              setTimeout(() => {
-                setDebugInfo('👁️ Ready');
-              }, 500);
+              setDebugInfo('👁️ Ready');
               
             }).catch(err => {
               console.error('AI extraction failed:', err);
@@ -211,82 +205,30 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       // Draw original image
       ctx.drawImage(video, 0, 0);
       
-      // Apply aggressive image enhancements for ANY quality
+      // FAST image enhancement - simplified for speed
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const data = imageData.data;
       
-      // Step 1: Calculate average brightness to auto-adjust
-      let totalBrightness = 0;
-      for (let i = 0; i < data.length; i += 4) {
-        totalBrightness += (data[i] + data[i + 1] + data[i + 2]) / 3;
-      }
-      const avgBrightness = totalBrightness / (data.length / 4);
+      // Fixed enhancement values for speed (no brightness calculation)
+      const brightnessBoost = 30;
+      const contrastMultiplier = 1.4;
       
-      // Step 2: Auto-adjust based on image brightness
-      // If image is dark (< 100), boost more. If bright (> 150), boost less.
-      const brightnessBoost = avgBrightness < 100 ? 40 : avgBrightness > 150 ? 10 : 25;
-      const contrastMultiplier = avgBrightness < 100 ? 1.5 : 1.3;
-      
-      // Step 3: Apply adaptive enhancement
+      // Quick contrast/brightness adjustment
       for (let i = 0; i < data.length; i += 4) {
-        // Apply contrast and brightness
-        data[i] = ((data[i] - 128) * contrastMultiplier) + 128 + brightnessBoost;
-        data[i + 1] = ((data[i + 1] - 128) * contrastMultiplier) + 128 + brightnessBoost;
-        data[i + 2] = ((data[i + 2] - 128) * contrastMultiplier) + 128 + brightnessBoost;
-        
-        // Clamp to valid range
-        data[i] = Math.max(0, Math.min(255, data[i]));
-        data[i + 1] = Math.max(0, Math.min(255, data[i + 1]));
-        data[i + 2] = Math.max(0, Math.min(255, data[i + 2]));
+        data[i] = Math.max(0, Math.min(255, ((data[i] - 128) * contrastMultiplier) + 128 + brightnessBoost));
+        data[i + 1] = Math.max(0, Math.min(255, ((data[i + 1] - 128) * contrastMultiplier) + 128 + brightnessBoost));
+        data[i + 2] = Math.max(0, Math.min(255, ((data[i + 2] - 128) * contrastMultiplier) + 128 + brightnessBoost));
       }
       
-      // Step 4: Apply sharpening filter for blurry images
-      const sharpenedData = sharpenImage(imageData);
+      // Put enhanced image back (skip sharpening for speed)
+      ctx.putImageData(imageData, 0, 0);
       
-      // Put enhanced image back
-      ctx.putImageData(sharpenedData, 0, 0);
-      
-      // Maximum quality
-      return canvas.toDataURL('image/jpeg', 1.0).split(',')[1];
+      // High quality JPEG
+      return canvas.toDataURL('image/jpeg', 0.95).split(',')[1];
     } catch (err) {
       console.error('Frame capture error:', err);
       return null;
     }
-  };
-
-  const sharpenImage = (imageData: ImageData): ImageData => {
-    const data = imageData.data;
-    const width = imageData.width;
-    const height = imageData.height;
-    const output = new ImageData(width, height);
-    
-    // Sharpening kernel
-    const kernel = [
-      0, -1, 0,
-      -1, 5, -1,
-      0, -1, 0
-    ];
-    
-    for (let y = 1; y < height - 1; y++) {
-      for (let x = 1; x < width - 1; x++) {
-        for (let c = 0; c < 3; c++) { // RGB channels only
-          let sum = 0;
-          for (let ky = -1; ky <= 1; ky++) {
-            for (let kx = -1; kx <= 1; kx++) {
-              const idx = ((y + ky) * width + (x + kx)) * 4 + c;
-              const kernelIdx = (ky + 1) * 3 + (kx + 1);
-              sum += data[idx] * kernel[kernelIdx];
-            }
-          }
-          const outIdx = (y * width + x) * 4 + c;
-          output.data[outIdx] = Math.max(0, Math.min(255, sum));
-        }
-        // Copy alpha channel
-        output.data[(y * width + x) * 4 + 3] = 255;
-      }
-    }
-    
-    return output;
   };
 
   const extractTextWithAI = async (base64Image: string): Promise<string> => {
