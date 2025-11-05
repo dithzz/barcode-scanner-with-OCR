@@ -95,11 +95,10 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       // Barcode + OCR mode (original behavior)
       const codeReader = new BrowserMultiFormatReader();
       
-      // Configure for maximum accuracy - more aggressive for difficult barcodes like USPS
+      // SPEED-OPTIMIZED: Remove TRY_HARDER for instant scanning
       const hints = new Map();
-      hints.set(DecodeHintType.TRY_HARDER, true); // More thorough scanning - critical for USPS barcodes
-      // Removed PURE_BARCODE - may interfere with detection of barcodes with text nearby
-      hints.set(DecodeHintType.ASSUME_GS1, false); // Don't assume GS1 format
+      // TRY_HARDER removed - makes it 3-5x faster
+      hints.set(DecodeHintType.ASSUME_GS1, false);
       codeReader.hints = hints;
       
       codeReaderRef.current = codeReader;
@@ -147,10 +146,10 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
         }
       );
 
-      // Start Quagga2 for 1D barcode scanning (parallel to ZXing)
-      startQuagga();
+      // DON'T start Quagga - ZXing is faster and more reliable
+      // startQuagga();
 
-      setDebugInfo('👁️ Scanning... (USPS tracking? Use OCR mode 📝)');
+      setDebugInfo('👁️ Ready - Lightning fast mode');
     } catch (err: any) {
       console.error('Scanner error:', err);
       let errorMessage = 'Failed to start camera. ';
@@ -179,12 +178,12 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       let constraints: MediaStreamConstraints = {
         video: {
           facingMode: facingMode,
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-          // @ts-ignore - advanced constraints for better barcode scanning
+          width: { ideal: 1280 },      // Lower res = faster processing
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 },    // 30 FPS for smooth scanning
+          // @ts-ignore - advanced constraints
           focusMode: 'continuous',
-          // @ts-ignore
-          zoom: { ideal: 1.0 }
+          focusDistance: { ideal: 0 }  // Auto-focus
         }
       };
 
@@ -215,12 +214,12 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
           constraints = {
             video: {
               deviceId: { exact: selectedDevice.deviceId },
-              width: { ideal: 1920 },
-              height: { ideal: 1080 },
-              // @ts-ignore - advanced constraints for better barcode scanning
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              frameRate: { ideal: 30 },
+              // @ts-ignore - advanced constraints
               focusMode: 'continuous',
-              // @ts-ignore
-              zoom: { ideal: 1.0 }
+              focusDistance: { ideal: 0 }
             }
           };
         }
@@ -308,8 +307,8 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
   const handleBarcodeDetected = async (barcodeValue: string, barcodeFormat: string, source: string) => {
     const now = Date.now();
     
-    // Only skip if EXACT same barcode scanned within 2 seconds
-    if (barcodeValue === lastBarcodeRef.current && now - lastScanTimeRef.current < 2000) {
+    // Only skip if EXACT same barcode scanned within 1 second
+    if (barcodeValue === lastBarcodeRef.current && now - lastScanTimeRef.current < 1000) {
       return;
     }
     
@@ -320,23 +319,7 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
     // Show status
     setDebugInfo(`⚡ ${barcodeValue}`);
     
-    // Take screenshot for AI
-    const screenshot = captureFrame();
-    
-    if (!screenshot) {
-      // Send barcode immediately without AI
-      onScan({
-        barcode: {
-          value: barcodeValue,
-          format: barcodeFormat
-        },
-        text: ''
-      });
-      setDebugInfo('👁️ Ready');
-      return;
-    }
-    
-    // Send barcode IMMEDIATELY, then get AI text in background
+    // Send barcode IMMEDIATELY
     onScan({
       barcode: {
         value: barcodeValue,
@@ -345,22 +328,10 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       text: ''
     });
     
-    // AI text extraction happens async - doesn't block next scan
-    extractTextWithAI(screenshot).then(extractedText => {
-      if (extractedText && extractedText.trim()) {
-        // Send updated result with text
-        onScan({
-          barcode: {
-            value: barcodeValue,
-            format: barcodeFormat
-          },
-          text: extractedText
-        });
-      }
-      setDebugInfo('👁️ Ready');
-    }).catch(() => {
-      setDebugInfo('👁️ Ready');
-    });
+    setDebugInfo('👁️ Ready');
+    
+    // NO AI extraction - pure speed mode
+    // If you need OCR, switch to OCR-only mode
   };
 
   const startQuagga = () => {
@@ -454,29 +425,11 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       
       if (!ctx) return null;
       
-      // Draw original image
+      // Draw original image - NO PROCESSING for maximum speed
       ctx.drawImage(video, 0, 0);
       
-      // FAST image enhancement - simplified for speed
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const data = imageData.data;
-      
-      // Fixed enhancement values for speed (no brightness calculation)
-      const brightnessBoost = 30;
-      const contrastMultiplier = 1.4;
-      
-      // Quick contrast/brightness adjustment
-      for (let i = 0; i < data.length; i += 4) {
-        data[i] = Math.max(0, Math.min(255, ((data[i] - 128) * contrastMultiplier) + 128 + brightnessBoost));
-        data[i + 1] = Math.max(0, Math.min(255, ((data[i + 1] - 128) * contrastMultiplier) + 128 + brightnessBoost));
-        data[i + 2] = Math.max(0, Math.min(255, ((data[i + 2] - 128) * contrastMultiplier) + 128 + brightnessBoost));
-      }
-      
-      // Put enhanced image back (skip sharpening for speed)
-      ctx.putImageData(imageData, 0, 0);
-      
-      // High quality JPEG
-      return canvas.toDataURL('image/jpeg', 0.95).split(',')[1];
+      // Return as JPEG with good quality
+      return canvas.toDataURL('image/jpeg', 0.92).split(',')[1];
     } catch (err) {
       console.error('Frame capture error:', err);
       return null;
