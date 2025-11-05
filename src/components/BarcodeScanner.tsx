@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { BrowserMultiFormatReader } from '@zxing/browser';
+import { DecodeHintType } from '@zxing/library';
+import Quagga from '@ericblade/quagga2';
 
 interface BarcodeScannerProps {
   onScan: (data: ScanResult) => void;
@@ -15,7 +17,7 @@ export interface ScanResult {
 }
 
 type CameraFacingMode = 'user' | 'environment';
-type ScanMode = 'barcode-ocr' | 'ocr-only';
+type ScanMode = 'barcode-ocr' | 'ocr-only' | 'photo-upload';
 
 export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
   const [error, setError] = useState('');
@@ -24,10 +26,30 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
   const [facingMode, setFacingMode] = useState<CameraFacingMode>('environment'); // Default to back camera
   const [scanMode, setScanMode] = useState<ScanMode>('barcode-ocr'); // Default to barcode + OCR
   const [availableCameras, setAvailableCameras] = useState<MediaDeviceInfo[]>([]);
+  const [isMobile, setIsMobile] = useState(false);
   const codeReaderRef = useRef<BrowserMultiFormatReader | null>(null);
+  const quaggaRunningRef = useRef<boolean>(false);
   const lastBarcodeRef = useRef<string>('');
   const lastScanTimeRef = useRef<number>(0);
   const ocrIntervalRef = useRef<number | null>(null);
+  const candidateBarcodesRef = useRef<Map<string, { format: string, source: string, count: number, firstSeen: number }>>(new Map());
+  const barcodeSelectionTimerRef = useRef<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    // Detect if device is mobile
+    const checkMobile = () => {
+      const userAgent = navigator.userAgent.toLowerCase();
+      const isMobileDevice = /iphone|ipad|ipod|android|blackberry|windows phone/g.test(userAgent);
+      const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+      setIsMobile(isMobileDevice || (isTouchDevice && window.innerWidth < 1024));
+    };
+    
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
 
   useEffect(() => {
     // Get available cameras
@@ -66,6 +88,16 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
         codeReaderRef.current = null;
       }
 
+      // Stop Quagga if running
+      if (quaggaRunningRef.current) {
+        try {
+          Quagga.stop();
+          quaggaRunningRef.current = false;
+        } catch (e) {
+          console.log('Quagga already stopped');
+        }
+      }
+
       // Stop any existing video stream
       if (videoRef.current?.srcObject) {
         const stream = videoRef.current.srcObject as MediaStream;
@@ -82,10 +114,11 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       // Barcode + OCR mode (original behavior)
       const codeReader = new BrowserMultiFormatReader();
       
-      // Configure for SPEED - remove TRY_HARDER for instant scanning
+      // Configure for maximum accuracy - more aggressive for difficult barcodes like USPS
       const hints = new Map();
-      // Removed TRY_HARDER for speed - sacrifices difficult barcodes for speed
-      hints.set(3, true); // PURE_BARCODE (ignore surrounding content)
+      hints.set(DecodeHintType.TRY_HARDER, true); // More thorough scanning - critical for USPS barcodes
+      // Removed PURE_BARCODE - may interfere with detection of barcodes with text nearby
+      hints.set(DecodeHintType.ASSUME_GS1, false); // Don't assume GS1 format
       codeReader.hints = hints;
       
       codeReaderRef.current = codeReader;
@@ -128,80 +161,15 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
           if (result) {
             const barcodeValue = result.getText();
             const barcodeFormat = result.getBarcodeFormat().toString();
-            
-            const now = Date.now();
-            
-            // Skip if this is the same barcode we just scanned (within 300ms)
-            if (barcodeValue === lastBarcodeRef.current && now - lastScanTimeRef.current < 300) {
-              return; // Skip immediate duplicates of same barcode
-            }
-            
-            // Skip if we're currently processing this exact barcode
-            if (isProcessing && barcodeValue === lastBarcodeRef.current) {
-              return;
-            }
-            
-            // Update references immediately
-            lastBarcodeRef.current = barcodeValue;
-            lastScanTimeRef.current = now;
-            
-            // Don't block on processing flag - allow new barcodes immediately
-            const wasProcessing = isProcessing;
-            setIsProcessing(true);
-            
-            // Show status immediately
-            setDebugInfo(`⚡ ${barcodeValue}`);
-            
-            // Take screenshot
-            const screenshot = captureFrame();
-            
-            if (!screenshot) {
-              // Send result immediately without AI
-              onScan({
-                barcode: {
-                  value: barcodeValue,
-                  format: barcodeFormat
-                },
-                text: ''
-              });
-              setIsProcessing(false);
-              setDebugInfo('👁️ Ready');
-              return;
-            }
-            
-            // Call AI for text extraction (don't await - let it run async)
-            extractTextWithAI(screenshot).then(extractedText => {
-              // Send result with extracted text
-              onScan({
-                barcode: {
-                  value: barcodeValue,
-                  format: barcodeFormat
-                },
-                text: extractedText || '(No text found)'
-              });
-              
-              // Reset processing flag immediately for next scan
-              setIsProcessing(false);
-              setDebugInfo('👁️ Ready');
-              
-            }).catch(err => {
-              console.error('AI extraction failed:', err);
-              // Send result even on error
-              onScan({
-                barcode: {
-                  value: barcodeValue,
-                  format: barcodeFormat
-                },
-                text: '(AI extraction failed)'
-              });
-              setIsProcessing(false);
-              setDebugInfo('👁️ Ready');
-            });
+            await handleBarcodeDetected(barcodeValue, barcodeFormat, 'ZXing');
           }
         }
       );
 
-      setDebugInfo('👁️ Ready - Show barcode to camera');
+      // Start Quagga2 for 1D barcode scanning (parallel to ZXing)
+      startQuagga();
+
+      setDebugInfo('👁️ Scanning... (USPS tracking? Use OCR mode 📝)');
     } catch (err: any) {
       console.error('Scanner error:', err);
       let errorMessage = 'Failed to start camera. ';
@@ -231,7 +199,11 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
         video: {
           facingMode: facingMode,
           width: { ideal: 1920 },
-          height: { ideal: 1080 }
+          height: { ideal: 1080 },
+          // @ts-ignore - advanced constraints for better barcode scanning
+          focusMode: 'continuous',
+          // @ts-ignore
+          zoom: { ideal: 1.0 }
         }
       };
 
@@ -263,7 +235,11 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
             video: {
               deviceId: { exact: selectedDevice.deviceId },
               width: { ideal: 1920 },
-              height: { ideal: 1080 }
+              height: { ideal: 1080 },
+              // @ts-ignore - advanced constraints for better barcode scanning
+              focusMode: 'continuous',
+              // @ts-ignore
+              zoom: { ideal: 1.0 }
             }
           };
         }
@@ -344,6 +320,232 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       }, 2000);
     } finally {
       setIsProcessing(false);
+    }
+  };
+
+  // Unified barcode handler for both ZXing and Quagga - with smart prioritization
+  const handleBarcodeDetected = async (barcodeValue: string, barcodeFormat: string, source: string) => {
+    const now = Date.now();
+    
+    // Skip if this is the same barcode we just processed
+    if (barcodeValue === lastBarcodeRef.current && now - lastScanTimeRef.current < 3000) {
+      return;
+    }
+    
+    // Add to candidates or update count
+    const existing = candidateBarcodesRef.current.get(barcodeValue);
+    if (existing) {
+      existing.count++;
+    } else {
+      candidateBarcodesRef.current.set(barcodeValue, {
+        format: barcodeFormat,
+        source: source,
+        count: 1,
+        firstSeen: now
+      });
+    }
+    
+    console.log(`${source}: Detected ${barcodeFormat} (len: ${barcodeValue.length}): ${barcodeValue}`);
+    
+    // Clear any existing selection timer
+    if (barcodeSelectionTimerRef.current) {
+      clearTimeout(barcodeSelectionTimerRef.current);
+    }
+    
+    // Wait 1500ms to collect multiple barcode detections, then pick the best one
+    barcodeSelectionTimerRef.current = window.setTimeout(() => {
+      selectBestBarcode();
+    }, 1500);
+  };
+  
+  const selectBestBarcode = async () => {
+    if (candidateBarcodesRef.current.size === 0 || isProcessing) return;
+    
+    console.log(`\n=== SELECTING BEST BARCODE (${candidateBarcodesRef.current.size} candidates) ===`);
+    
+    // PRIORITY SYSTEM for consistent results:
+    // 1. ALWAYS prefer Code 128 over product barcodes (EAN, UPC)
+    // 2. Among Code 128s, pick the longest one (tracking numbers are long)
+    // 3. Ignore short product barcodes when Code 128 is available
+    
+    let bestBarcode = '';
+    let bestData: any = null;
+    let hasCode128 = false;
+    
+    // First pass: check if we have any Code 128 barcodes
+    for (const [code, data] of candidateBarcodesRef.current.entries()) {
+      console.log(`  Candidate: ${data.format} (len: ${code.length}, count: ${data.count}) - ${code}`);
+      if (data.format === 'code_128') {
+        hasCode128 = true;
+      }
+    }
+    
+    console.log(`  Has Code 128: ${hasCode128}`);
+    
+    // Second pass: select best barcode with priority rules
+    for (const [code, data] of candidateBarcodesRef.current.entries()) {
+      // If we have Code 128, IGNORE all non-Code 128 barcodes
+      if (hasCode128 && data.format !== 'code_128') {
+        console.log(`  ⊗ Skipping ${data.format} (${code}) - Code 128 takes priority`);
+        continue;
+      }
+      
+      // Select if: first barcode OR longer than current best OR same length but more detections
+      if (!bestBarcode || 
+          code.length > bestBarcode.length ||
+          (code.length === bestBarcode.length && data.count > bestData.count)) {
+        bestBarcode = code;
+        bestData = data;
+      }
+    }
+    
+    if (!bestBarcode) {
+      console.log(`  ⚠️ NO VALID BARCODE FOUND - Try OCR mode for USPS tracking numbers\n`);
+      return;
+    }
+    
+    console.log(`  ✓✓✓ FINAL SELECTION: ${bestData.format} (len: ${bestBarcode.length}, count: ${bestData.count})`);
+    console.log(`  Value: ${bestBarcode}`);
+    
+    // SPECIAL: For USPS labels, also extract tracking number via OCR
+    // The printed tracking number is more reliable than the barcode
+    if (bestBarcode.length >= 20 && bestData.format === 'code_128') {
+      console.log(`  ℹ️ Long Code 128 detected - this might be encoded USPS data`);
+      console.log(`  💡 TIP: Switch to OCR mode (📝) to get the actual tracking number\n`);
+    } else {
+      console.log();
+    }
+    
+    // Clear candidates
+    candidateBarcodesRef.current.clear();
+    
+    // Update references
+    lastBarcodeRef.current = bestBarcode;
+    lastScanTimeRef.current = Date.now();
+    setIsProcessing(true);
+    
+    // Show status
+    setDebugInfo(`⚡ ${bestBarcode}`);
+    
+    // Take screenshot
+    const screenshot = captureFrame();
+    
+    if (!screenshot) {
+      onScan({
+        barcode: {
+          value: bestBarcode,
+          format: bestData.format
+        },
+        text: ''
+      });
+      setIsProcessing(false);
+      setDebugInfo('👁️ Ready');
+      return;
+    }
+    
+    // Call AI for text extraction (async)
+    extractTextWithAI(screenshot).then(extractedText => {
+      onScan({
+        barcode: {
+          value: bestBarcode,
+          format: bestData.format
+        },
+        text: extractedText || '(No text found)'
+      });
+      setIsProcessing(false);
+      setDebugInfo('👁️ Ready');
+    }).catch(err => {
+      console.error('AI extraction failed:', err);
+      onScan({
+        barcode: {
+          value: bestBarcode,
+          format: bestData.format
+        },
+        text: '(AI extraction failed)'
+      });
+      setIsProcessing(false);
+      setDebugInfo('👁️ Ready');
+    });
+  };
+
+  const startQuagga = () => {
+    if (!videoRef.current || quaggaRunningRef.current) return;
+
+    try {
+      Quagga.init({
+        inputStream: {
+          name: "Live",
+          type: "LiveStream",
+          target: videoRef.current,
+          constraints: {
+            facingMode: facingMode,
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
+          },
+          area: { // Focus on center area where user likely points barcode
+            top: "20%",
+            right: "10%",
+            left: "10%",
+            bottom: "20%"
+          }
+        },
+        decoder: {
+          readers: [
+            "code_128_reader",    // USPS tracking, shipping labels - PRIMARY
+            "code_39_reader",     // General purpose
+            "ean_reader",         // Products
+            "upc_reader",         // Products
+            "codabar_reader"      // Other formats
+          ],
+          multiple: false,
+          // Add quality settings for better accuracy
+          debug: {
+            drawBoundingBox: false,
+            showFrequency: false,
+            drawScanline: false,
+            showPattern: false
+          }
+        },
+        locate: true,
+        locator: {
+          patchSize: "x-large",    // Largest patch size for difficult barcodes
+          halfSample: false        // Full resolution
+        },
+        frequency: 20,             // Increased from 10 to 20 scans per second
+        numOfWorkers: 0,           // Use main thread for better performance
+        debug: false
+      }, (err) => {
+        if (err) {
+          console.error('Quagga initialization error:', err);
+          return;
+        }
+        
+        Quagga.start();
+        quaggaRunningRef.current = true;
+        
+        Quagga.onDetected(async (result) => {
+          if (result && result.codeResult && result.codeResult.code) {
+            const code = result.codeResult.code;
+            const format = result.codeResult.format || 'unknown';
+            
+            // Very lenient quality check - accept almost everything
+            const quality = result.codeResult.decodedCodes
+              .filter((code: any) => code.error !== undefined)
+              .reduce((sum: number, code: any) => sum + code.error, 0) / result.codeResult.decodedCodes.length;
+            
+            // Only reject extremely poor reads
+            if (quality > 0.35) {
+              console.log(`Quagga: Poor quality rejected (error: ${quality.toFixed(3)})`);
+              return;
+            }
+            
+            console.log(`Quagga: ✓ Detected ${format} (error: ${quality.toFixed(3)}, len: ${code.length}): ${code}`);
+            await handleBarcodeDetected(code, format, 'Quagga');
+          }
+        });
+      });
+    } catch (err) {
+      console.error('Quagga start error:', err);
     }
   };
 
@@ -461,18 +663,127 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
   };
 
   const toggleScanMode = () => {
-    setScanMode(prev => prev === 'barcode-ocr' ? 'ocr-only' : 'barcode-ocr');
+    setScanMode(prev => {
+      // On desktop, skip photo-upload mode (file picker only)
+      if (!isMobile) {
+        return prev === 'barcode-ocr' ? 'ocr-only' : 'barcode-ocr';
+      }
+      // On mobile, cycle through all 3 modes
+      const modes: ScanMode[] = ['barcode-ocr', 'ocr-only', 'photo-upload'];
+      const currentIndex = modes.indexOf(prev);
+      const nextIndex = (currentIndex + 1) % modes.length;
+      return modes[nextIndex];
+    });
+  };
+
+  const handlePhotoUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setIsProcessing(true);
+    setDebugInfo('📸 Processing photo...');
+
+    try {
+      // Convert image to base64
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        const base64Image = e.target?.result as string;
+        const base64Data = base64Image.split(',')[1];
+
+        // Try barcode detection first
+        try {
+          const codeReader = new BrowserMultiFormatReader();
+          const hints = new Map();
+          hints.set(DecodeHintType.TRY_HARDER, true);
+          codeReader.hints = hints;
+
+          const result = await codeReader.decodeFromImageUrl(base64Image);
+          
+          if (result) {
+            const barcodeValue = result.getText();
+            const barcodeFormat = result.getBarcodeFormat().toString();
+            
+            setDebugInfo('✓ Barcode detected!');
+            
+            // Also extract text via OCR
+            const extractedText = await extractTextWithAI(base64Data);
+            
+            onScan({
+              barcode: {
+                value: barcodeValue,
+                format: barcodeFormat
+              },
+              text: extractedText || ''
+            });
+            
+            setIsProcessing(false);
+            setDebugInfo('📸 Photo Mode - Tap to capture');
+            return;
+          }
+        } catch (barcodeErr) {
+          console.log('No barcode found in image, trying OCR...');
+        }
+
+        // Fallback to OCR if no barcode found
+        const extractedText = await extractTextWithAI(base64Data);
+        
+        if (extractedText && extractedText.trim()) {
+          onScan({
+            text: extractedText
+          });
+          setDebugInfo('✓ Text extracted!');
+        } else {
+          setDebugInfo('⚠️ No barcode or text found');
+        }
+        
+        setIsProcessing(false);
+        setTimeout(() => {
+          setDebugInfo('📸 Photo Mode - Tap to capture');
+        }, 2000);
+      };
+
+      reader.readAsDataURL(file);
+    } catch (err) {
+      console.error('Photo processing error:', err);
+      setDebugInfo('❌ Processing failed');
+      setIsProcessing(false);
+    }
+
+    // Reset input so same file can be selected again
+    event.target.value = '';
+  };
+
+  const triggerPhotoCapture = () => {
+    fileInputRef.current?.click();
   };
 
   return (
     <div className="scanner-container">
+      {/* Hidden file input for native camera/photo picker */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        style={{ display: 'none' }}
+        onChange={handlePhotoUpload}
+      />
+      
       <video 
         ref={videoRef} 
         className="scanner-video"
+        style={{ display: scanMode === 'photo-upload' ? 'none' : 'block' }}
         playsInline
         autoPlay
         muted
       />
+      {scanMode === 'photo-upload' && (
+        <div className="photo-upload-placeholder" onClick={triggerPhotoCapture}>
+          <div className="upload-icon">📸</div>
+          <p>Tap to {isMobile ? 'capture photo' : 'select image'}</p>
+          <p className="upload-hint">{isMobile ? 'Uses native camera' : 'Upload from files'}</p>
+        </div>
+      )}
       <div className="scanner-overlay">
         <div className="scanner-frame">
           <div className="corner top-left"></div>
@@ -486,11 +797,15 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
         className="mode-toggle-btn" 
         onClick={toggleScanMode}
         aria-label="Toggle scan mode"
-        title={scanMode === 'barcode-ocr' ? 'Switch to OCR Only' : 'Switch to Barcode + OCR'}
+        title={
+          scanMode === 'barcode-ocr' ? 'Switch to OCR Only' : 
+          scanMode === 'ocr-only' ? 'Switch to Photo Mode' : 
+          'Switch to Barcode + OCR'
+        }
       >
-        {scanMode === 'barcode-ocr' ? '📊' : '📝'}
+        {scanMode === 'barcode-ocr' ? '📊' : scanMode === 'ocr-only' ? '📝' : '📷'}
       </button>
-      {availableCameras.length > 1 && (
+      {availableCameras.length > 1 && scanMode !== 'photo-upload' && (
         <button 
           className="camera-switch-btn" 
           onClick={toggleCamera}
@@ -509,6 +824,16 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
           {isProcessing ? '⏳' : '📸'}
         </button>
       )}
+      {scanMode === 'photo-upload' && (
+        <button 
+          className="ocr-scan-btn" 
+          onClick={triggerPhotoCapture}
+          disabled={isProcessing}
+          aria-label="Capture photo"
+        >
+          {isProcessing ? '⏳' : '📸'}
+        </button>
+      )}
       {error && (
         <div className="error-message">
           <p>{error}</p>
@@ -519,7 +844,9 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
         {debugInfo}
       </div>
       <div className="mode-indicator">
-        {scanMode === 'barcode-ocr' ? '📊 Barcode + OCR' : '📝 OCR Only'}
+        {scanMode === 'barcode-ocr' ? '📊 Barcode + OCR' : 
+         scanMode === 'ocr-only' ? '📝 OCR Only' : 
+         '📷 Photo Mode'}
       </div>
     </div>
   );
