@@ -25,7 +25,6 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
   const codeReaderRef = useRef<BrowserMultiFormatReader | null>(null);
   const lastBarcodeRef = useRef<string>('');
   const lastScanTimeRef = useRef<number>(0);
-  const processedBarcodesRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     // Get available cameras
@@ -52,9 +51,11 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
 
       const codeReader = new BrowserMultiFormatReader();
       
-      // Configure for better barcode detection
+      // Configure for MAXIMUM barcode detection - work with ANY quality
       const hints = new Map();
-      hints.set(2, true); // TRY_HARDER mode for difficult barcodes
+      hints.set(2, true); // TRY_HARDER mode
+      hints.set(3, true); // PURE_BARCODE (ignore surrounding content)
+      hints.set(4, true); // ASSUME_GS1 (support GS1 barcodes)
       codeReader.hints = hints;
       
       codeReaderRef.current = codeReader;
@@ -100,34 +101,32 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
             
             const now = Date.now();
             
-            // Skip if we're already processing OR if this barcode was recently scanned
-            if (isProcessing) {
+            // Skip if this is the same barcode we just scanned (within 1 second)
+            if (barcodeValue === lastBarcodeRef.current && now - lastScanTimeRef.current < 1000) {
+              return; // Skip immediate duplicates of same barcode
+            }
+            
+            // Skip if we're currently processing this exact barcode
+            if (isProcessing && barcodeValue === lastBarcodeRef.current) {
               return;
             }
             
-            // Check if we already processed this exact barcode recently (within 5 seconds)
-            if (barcodeValue === lastBarcodeRef.current && now - lastScanTimeRef.current < 5000) {
-              return; // Skip duplicate
-            }
-            
-            // Check if this barcode was already fully processed
-            if (processedBarcodesRef.current.has(barcodeValue)) {
-              return; // Already processed, skip
-            }
-            
-            // Mark as processing to prevent concurrent scans
-            setIsProcessing(true);
+            // Update references immediately
             lastBarcodeRef.current = barcodeValue;
             lastScanTimeRef.current = now;
             
-            // Show status but DON'T call onScan yet
-            setDebugInfo(`✅ Barcode: ${barcodeValue} - Extracting text...`);
+            // Don't block on processing flag - allow new barcodes immediately
+            const wasProcessing = isProcessing;
+            setIsProcessing(true);
+            
+            // Show status immediately
+            setDebugInfo(`✅ ${barcodeValue} - Extracting text...`);
             
             // Take screenshot
             const screenshot = captureFrame();
             
             if (!screenshot) {
-              // Only call onScan ONCE with final result
+              // Send result immediately without AI
               onScan({
                 barcode: {
                   value: barcodeValue,
@@ -140,14 +139,9 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
               return;
             }
             
-            // Call AI ONCE for this barcode
-            try {
-              const extractedText = await extractTextWithAI(screenshot);
-              
-              // Mark this barcode as fully processed
-              processedBarcodesRef.current.add(barcodeValue);
-              
-              // Call onScan ONLY ONCE with complete result
+            // Call AI for text extraction (don't await - let it run async)
+            extractTextWithAI(screenshot).then(extractedText => {
+              // Send result with extracted text
               onScan({
                 barcode: {
                   value: barcodeValue,
@@ -158,14 +152,16 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
               
               setDebugInfo('✨ Complete!');
               
-              // Clear from processed set after 10 seconds to allow re-scanning later
-              setTimeout(() => {
-                processedBarcodesRef.current.delete(barcodeValue);
-              }, 10000);
+              // Reset processing flag immediately
+              setIsProcessing(false);
               
-            } catch (err) {
+              setTimeout(() => {
+                setDebugInfo('👁️ Ready');
+              }, 500);
+              
+            }).catch(err => {
               console.error('AI extraction failed:', err);
-              // Only call onScan ONCE even on error
+              // Send result even on error
               onScan({
                 barcode: {
                   value: barcodeValue,
@@ -173,12 +169,9 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
                 },
                 text: '(AI extraction failed)'
               });
-            } finally {
               setIsProcessing(false);
-              setTimeout(() => {
-                setDebugInfo('👁️ Ready');
-              }, 1500);
-            }
+              setDebugInfo('👁️ Ready');
+            });
           }
         }
       );
@@ -218,35 +211,82 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       // Draw original image
       ctx.drawImage(video, 0, 0);
       
-      // Apply image enhancements for better quality
+      // Apply aggressive image enhancements for ANY quality
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const data = imageData.data;
       
-      // Increase contrast and brightness for poor lighting
-      const contrast = 1.3; // 30% more contrast
-      const brightness = 20; // Increase brightness
-      
+      // Step 1: Calculate average brightness to auto-adjust
+      let totalBrightness = 0;
       for (let i = 0; i < data.length; i += 4) {
-        // Apply contrast
-        data[i] = ((data[i] - 128) * contrast) + 128 + brightness;     // Red
-        data[i + 1] = ((data[i + 1] - 128) * contrast) + 128 + brightness; // Green
-        data[i + 2] = ((data[i + 2] - 128) * contrast) + 128 + brightness; // Blue
+        totalBrightness += (data[i] + data[i + 1] + data[i + 2]) / 3;
+      }
+      const avgBrightness = totalBrightness / (data.length / 4);
+      
+      // Step 2: Auto-adjust based on image brightness
+      // If image is dark (< 100), boost more. If bright (> 150), boost less.
+      const brightnessBoost = avgBrightness < 100 ? 40 : avgBrightness > 150 ? 10 : 25;
+      const contrastMultiplier = avgBrightness < 100 ? 1.5 : 1.3;
+      
+      // Step 3: Apply adaptive enhancement
+      for (let i = 0; i < data.length; i += 4) {
+        // Apply contrast and brightness
+        data[i] = ((data[i] - 128) * contrastMultiplier) + 128 + brightnessBoost;
+        data[i + 1] = ((data[i + 1] - 128) * contrastMultiplier) + 128 + brightnessBoost;
+        data[i + 2] = ((data[i + 2] - 128) * contrastMultiplier) + 128 + brightnessBoost;
         
-        // Clamp values to 0-255
+        // Clamp to valid range
         data[i] = Math.max(0, Math.min(255, data[i]));
         data[i + 1] = Math.max(0, Math.min(255, data[i + 1]));
         data[i + 2] = Math.max(0, Math.min(255, data[i + 2]));
       }
       
-      // Put enhanced image back
-      ctx.putImageData(imageData, 0, 0);
+      // Step 4: Apply sharpening filter for blurry images
+      const sharpenedData = sharpenImage(imageData);
       
-      // Use higher quality for better recognition
-      return canvas.toDataURL('image/jpeg', 0.98).split(',')[1];
+      // Put enhanced image back
+      ctx.putImageData(sharpenedData, 0, 0);
+      
+      // Maximum quality
+      return canvas.toDataURL('image/jpeg', 1.0).split(',')[1];
     } catch (err) {
       console.error('Frame capture error:', err);
       return null;
     }
+  };
+
+  const sharpenImage = (imageData: ImageData): ImageData => {
+    const data = imageData.data;
+    const width = imageData.width;
+    const height = imageData.height;
+    const output = new ImageData(width, height);
+    
+    // Sharpening kernel
+    const kernel = [
+      0, -1, 0,
+      -1, 5, -1,
+      0, -1, 0
+    ];
+    
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        for (let c = 0; c < 3; c++) { // RGB channels only
+          let sum = 0;
+          for (let ky = -1; ky <= 1; ky++) {
+            for (let kx = -1; kx <= 1; kx++) {
+              const idx = ((y + ky) * width + (x + kx)) * 4 + c;
+              const kernelIdx = (ky + 1) * 3 + (kx + 1);
+              sum += data[idx] * kernel[kernelIdx];
+            }
+          }
+          const outIdx = (y * width + x) * 4 + c;
+          output.data[outIdx] = Math.max(0, Math.min(255, sum));
+        }
+        // Copy alpha channel
+        output.data[(y * width + x) * 4 + 3] = 255;
+      }
+    }
+    
+    return output;
   };
 
   const extractTextWithAI = async (base64Image: string): Promise<string> => {
@@ -274,7 +314,7 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
               content: [
                 {
                   type: 'text',
-                  text: 'Extract ALL visible text from this image. Focus on: product names, descriptions, brand names, labels, or any text near the barcode. Return ONLY the extracted text as plain text. If no text visible, return empty string.'
+                  text: 'Extract ALL readable text from this image, even if blurry, low quality, or partially visible. Look for: product names, brands, descriptions, labels, prices, ingredients, or ANY text near/around barcodes. Try your best to read imperfect, tilted, or low-resolution text. Return ONLY the extracted text. If truly nothing is readable, return empty string.'
                 },
                 {
                   type: 'image_url',
@@ -285,8 +325,8 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
               ]
             }
           ],
-          max_tokens: 300,
-          temperature: 0
+          max_tokens: 500,
+          temperature: 0.1
         })
       });
 
