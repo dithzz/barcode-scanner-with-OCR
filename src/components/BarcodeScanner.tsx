@@ -17,7 +17,7 @@ export interface ScanResult {
 }
 
 type CameraFacingMode = 'user' | 'environment';
-type ScanMode = 'barcode-ocr' | 'ocr-only' | 'photo-upload';
+type ScanMode = 'barcode-ocr' | 'ocr-only';
 
 export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
   const [error, setError] = useState('');
@@ -26,7 +26,6 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
   const [facingMode, setFacingMode] = useState<CameraFacingMode>('environment'); // Default to back camera
   const [scanMode, setScanMode] = useState<ScanMode>('barcode-ocr'); // Default to barcode + OCR
   const [availableCameras, setAvailableCameras] = useState<MediaDeviceInfo[]>([]);
-  const [isMobile, setIsMobile] = useState(false);
   const codeReaderRef = useRef<BrowserMultiFormatReader | null>(null);
   const quaggaRunningRef = useRef<boolean>(false);
   const lastBarcodeRef = useRef<string>('');
@@ -34,22 +33,6 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
   const ocrIntervalRef = useRef<number | null>(null);
   const candidateBarcodesRef = useRef<Map<string, { format: string, source: string, count: number, firstSeen: number }>>(new Map());
   const barcodeSelectionTimerRef = useRef<number | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    // Detect if device is mobile
-    const checkMobile = () => {
-      const userAgent = navigator.userAgent.toLowerCase();
-      const isMobileDevice = /iphone|ipad|ipod|android|blackberry|windows phone/g.test(userAgent);
-      const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-      setIsMobile(isMobileDevice || (isTouchDevice && window.innerWidth < 1024));
-    };
-    
-    checkMobile();
-    window.addEventListener('resize', checkMobile);
-    
-    return () => window.removeEventListener('resize', checkMobile);
-  }, []);
 
   useEffect(() => {
     // Get available cameras
@@ -352,21 +335,14 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       clearTimeout(barcodeSelectionTimerRef.current);
     }
     
-    // Wait 1500ms to collect multiple barcode detections, then pick the best one
+    // FAST: Wait only 500ms to collect barcode detections, then pick the best one
     barcodeSelectionTimerRef.current = window.setTimeout(() => {
       selectBestBarcode();
-    }, 1500);
+    }, 500);
   };
   
   const selectBestBarcode = async () => {
     if (candidateBarcodesRef.current.size === 0 || isProcessing) return;
-    
-    console.log(`\n=== SELECTING BEST BARCODE (${candidateBarcodesRef.current.size} candidates) ===`);
-    
-    // PRIORITY SYSTEM for consistent results:
-    // 1. ALWAYS prefer Code 128 over product barcodes (EAN, UPC)
-    // 2. Among Code 128s, pick the longest one (tracking numbers are long)
-    // 3. Ignore short product barcodes when Code 128 is available
     
     let bestBarcode = '';
     let bestData: any = null;
@@ -374,19 +350,16 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
     
     // First pass: check if we have any Code 128 barcodes
     for (const [code, data] of candidateBarcodesRef.current.entries()) {
-      console.log(`  Candidate: ${data.format} (len: ${code.length}, count: ${data.count}) - ${code}`);
       if (data.format === 'code_128') {
         hasCode128 = true;
+        break;
       }
     }
-    
-    console.log(`  Has Code 128: ${hasCode128}`);
     
     // Second pass: select best barcode with priority rules
     for (const [code, data] of candidateBarcodesRef.current.entries()) {
       // If we have Code 128, IGNORE all non-Code 128 barcodes
       if (hasCode128 && data.format !== 'code_128') {
-        console.log(`  ⊗ Skipping ${data.format} (${code}) - Code 128 takes priority`);
         continue;
       }
       
@@ -399,22 +372,7 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       }
     }
     
-    if (!bestBarcode) {
-      console.log(`  ⚠️ NO VALID BARCODE FOUND - Try OCR mode for USPS tracking numbers\n`);
-      return;
-    }
-    
-    console.log(`  ✓✓✓ FINAL SELECTION: ${bestData.format} (len: ${bestBarcode.length}, count: ${bestData.count})`);
-    console.log(`  Value: ${bestBarcode}`);
-    
-    // SPECIAL: For USPS labels, also extract tracking number via OCR
-    // The printed tracking number is more reliable than the barcode
-    if (bestBarcode.length >= 20 && bestData.format === 'code_128') {
-      console.log(`  ℹ️ Long Code 128 detected - this might be encoded USPS data`);
-      console.log(`  💡 TIP: Switch to OCR mode (📝) to get the actual tracking number\n`);
-    } else {
-      console.log();
-    }
+    if (!bestBarcode) return;
     
     // Clear candidates
     candidateBarcodesRef.current.clear();
@@ -511,7 +469,7 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
           patchSize: "x-large",    // Largest patch size for difficult barcodes
           halfSample: false        // Full resolution
         },
-        frequency: 20,             // Increased from 10 to 20 scans per second
+        frequency: 30,             // FAST: 30 scans per second for instant detection
         numOfWorkers: 0,           // Use main thread for better performance
         debug: false
       }, (err) => {
@@ -663,127 +621,18 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
   };
 
   const toggleScanMode = () => {
-    setScanMode(prev => {
-      // On desktop, skip photo-upload mode (file picker only)
-      if (!isMobile) {
-        return prev === 'barcode-ocr' ? 'ocr-only' : 'barcode-ocr';
-      }
-      // On mobile, cycle through all 3 modes
-      const modes: ScanMode[] = ['barcode-ocr', 'ocr-only', 'photo-upload'];
-      const currentIndex = modes.indexOf(prev);
-      const nextIndex = (currentIndex + 1) % modes.length;
-      return modes[nextIndex];
-    });
-  };
-
-  const handlePhotoUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    setIsProcessing(true);
-    setDebugInfo('📸 Processing photo...');
-
-    try {
-      // Convert image to base64
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        const base64Image = e.target?.result as string;
-        const base64Data = base64Image.split(',')[1];
-
-        // Try barcode detection first
-        try {
-          const codeReader = new BrowserMultiFormatReader();
-          const hints = new Map();
-          hints.set(DecodeHintType.TRY_HARDER, true);
-          codeReader.hints = hints;
-
-          const result = await codeReader.decodeFromImageUrl(base64Image);
-          
-          if (result) {
-            const barcodeValue = result.getText();
-            const barcodeFormat = result.getBarcodeFormat().toString();
-            
-            setDebugInfo('✓ Barcode detected!');
-            
-            // Also extract text via OCR
-            const extractedText = await extractTextWithAI(base64Data);
-            
-            onScan({
-              barcode: {
-                value: barcodeValue,
-                format: barcodeFormat
-              },
-              text: extractedText || ''
-            });
-            
-            setIsProcessing(false);
-            setDebugInfo('📸 Photo Mode - Tap to capture');
-            return;
-          }
-        } catch (barcodeErr) {
-          console.log('No barcode found in image, trying OCR...');
-        }
-
-        // Fallback to OCR if no barcode found
-        const extractedText = await extractTextWithAI(base64Data);
-        
-        if (extractedText && extractedText.trim()) {
-          onScan({
-            text: extractedText
-          });
-          setDebugInfo('✓ Text extracted!');
-        } else {
-          setDebugInfo('⚠️ No barcode or text found');
-        }
-        
-        setIsProcessing(false);
-        setTimeout(() => {
-          setDebugInfo('📸 Photo Mode - Tap to capture');
-        }, 2000);
-      };
-
-      reader.readAsDataURL(file);
-    } catch (err) {
-      console.error('Photo processing error:', err);
-      setDebugInfo('❌ Processing failed');
-      setIsProcessing(false);
-    }
-
-    // Reset input so same file can be selected again
-    event.target.value = '';
-  };
-
-  const triggerPhotoCapture = () => {
-    fileInputRef.current?.click();
+    setScanMode(prev => prev === 'barcode-ocr' ? 'ocr-only' : 'barcode-ocr');
   };
 
   return (
     <div className="scanner-container">
-      {/* Hidden file input for native camera/photo picker */}
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept="image/*"
-        capture="environment"
-        style={{ display: 'none' }}
-        onChange={handlePhotoUpload}
-      />
-      
       <video 
         ref={videoRef} 
         className="scanner-video"
-        style={{ display: scanMode === 'photo-upload' ? 'none' : 'block' }}
         playsInline
         autoPlay
         muted
       />
-      {scanMode === 'photo-upload' && (
-        <div className="photo-upload-placeholder" onClick={triggerPhotoCapture}>
-          <div className="upload-icon">📸</div>
-          <p>Tap to {isMobile ? 'capture photo' : 'select image'}</p>
-          <p className="upload-hint">{isMobile ? 'Uses native camera' : 'Upload from files'}</p>
-        </div>
-      )}
       <div className="scanner-overlay">
         <div className="scanner-frame">
           <div className="corner top-left"></div>
@@ -797,15 +646,11 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
         className="mode-toggle-btn" 
         onClick={toggleScanMode}
         aria-label="Toggle scan mode"
-        title={
-          scanMode === 'barcode-ocr' ? 'Switch to OCR Only' : 
-          scanMode === 'ocr-only' ? 'Switch to Photo Mode' : 
-          'Switch to Barcode + OCR'
-        }
+        title={scanMode === 'barcode-ocr' ? 'Switch to OCR Only' : 'Switch to Barcode + OCR'}
       >
-        {scanMode === 'barcode-ocr' ? '📊' : scanMode === 'ocr-only' ? '📝' : '📷'}
+        {scanMode === 'barcode-ocr' ? '📊' : '📝'}
       </button>
-      {availableCameras.length > 1 && scanMode !== 'photo-upload' && (
+      {availableCameras.length > 1 && (
         <button 
           className="camera-switch-btn" 
           onClick={toggleCamera}
@@ -824,16 +669,6 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
           {isProcessing ? '⏳' : '📸'}
         </button>
       )}
-      {scanMode === 'photo-upload' && (
-        <button 
-          className="ocr-scan-btn" 
-          onClick={triggerPhotoCapture}
-          disabled={isProcessing}
-          aria-label="Capture photo"
-        >
-          {isProcessing ? '⏳' : '📸'}
-        </button>
-      )}
       {error && (
         <div className="error-message">
           <p>{error}</p>
@@ -844,9 +679,7 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
         {debugInfo}
       </div>
       <div className="mode-indicator">
-        {scanMode === 'barcode-ocr' ? '📊 Barcode + OCR' : 
-         scanMode === 'ocr-only' ? '📝 OCR Only' : 
-         '📷 Photo Mode'}
+        {scanMode === 'barcode-ocr' ? '📊 Barcode + OCR' : '📝 OCR Only'}
       </div>
     </div>
   );
