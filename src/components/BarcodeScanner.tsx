@@ -15,16 +15,19 @@ export interface ScanResult {
 }
 
 type CameraFacingMode = 'user' | 'environment';
+type ScanMode = 'barcode-ocr' | 'ocr-only';
 
 export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
   const [error, setError] = useState('');
   const [debugInfo, setDebugInfo] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [facingMode, setFacingMode] = useState<CameraFacingMode>('environment'); // Default to back camera
+  const [scanMode, setScanMode] = useState<ScanMode>('barcode-ocr'); // Default to barcode + OCR
   const [availableCameras, setAvailableCameras] = useState<MediaDeviceInfo[]>([]);
   const codeReaderRef = useRef<BrowserMultiFormatReader | null>(null);
   const lastBarcodeRef = useRef<string>('');
   const lastScanTimeRef = useRef<number>(0);
+  const ocrIntervalRef = useRef<number | null>(null);
 
   useEffect(() => {
     // Get available cameras
@@ -40,15 +43,43 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
     startScanning();
 
     return () => {
-      // Cleanup handled by ZXing
+      // Cleanup
+      if (ocrIntervalRef.current) {
+        clearInterval(ocrIntervalRef.current);
+      }
     };
-  }, [facingMode]);
+  }, [facingMode, scanMode]);
 
   const startScanning = async () => {
     try {
       setError('');
       setDebugInfo('📸 Starting camera...');
 
+      // Clear any existing OCR interval
+      if (ocrIntervalRef.current) {
+        clearInterval(ocrIntervalRef.current);
+        ocrIntervalRef.current = null;
+      }
+
+      // Stop any existing barcode scanner
+      if (codeReaderRef.current) {
+        codeReaderRef.current = null;
+      }
+
+      // Stop any existing video stream
+      if (videoRef.current?.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+        videoRef.current.srcObject = null;
+      }
+
+      // If OCR-only mode, start camera and OCR interval instead of barcode scanning
+      if (scanMode === 'ocr-only') {
+        await startOCROnlyMode();
+        return;
+      }
+
+      // Barcode + OCR mode (original behavior)
       const codeReader = new BrowserMultiFormatReader();
       
       // Configure for SPEED - remove TRY_HARDER for instant scanning
@@ -190,6 +221,132 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
     }
   };
 
+  const startOCROnlyMode = async () => {
+    try {
+      // Start camera without barcode scanning
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(device => device.kind === 'videoinput');
+      
+      let constraints: MediaStreamConstraints = {
+        video: {
+          facingMode: facingMode,
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
+      };
+
+      // Try to use specific device if available
+      if (videoDevices.length > 0) {
+        const backCamera = videoDevices.find(device => 
+          device.label.toLowerCase().includes('back') || 
+          device.label.toLowerCase().includes('rear') ||
+          device.label.toLowerCase().includes('environment')
+        );
+        const frontCamera = videoDevices.find(device => 
+          device.label.toLowerCase().includes('front') || 
+          device.label.toLowerCase().includes('user')
+        );
+        
+        let selectedDevice;
+        if (facingMode === 'environment' && backCamera) {
+          selectedDevice = backCamera;
+        } else if (facingMode === 'user' && frontCamera) {
+          selectedDevice = frontCamera;
+        } else {
+          selectedDevice = facingMode === 'environment' 
+            ? videoDevices[videoDevices.length - 1]
+            : videoDevices[0];
+        }
+
+        if (selectedDevice) {
+          constraints = {
+            video: {
+              deviceId: { exact: selectedDevice.deviceId },
+              width: { ideal: 1920 },
+              height: { ideal: 1080 }
+            }
+          };
+        }
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+
+      setDebugInfo('📸 OCR Mode - Click to scan or auto-scans every 3s');
+
+      // No auto-scan - user will tap to scan
+      setDebugInfo('📸 OCR Mode - Tap scan button');
+
+    } catch (err: any) {
+      console.error('OCR mode error:', err);
+      let errorMessage = 'Failed to start OCR mode: ';
+      
+      if (err.name === 'NotAllowedError') {
+        errorMessage += 'Please allow camera access.';
+      } else if (err.name === 'NotFoundError') {
+        errorMessage += 'No camera found.';
+      } else if (err.name === 'NotReadableError') {
+        errorMessage += 'Camera is in use.';
+      } else {
+        errorMessage += err.message;
+      }
+      
+      setError(errorMessage);
+      setDebugInfo('Error: ' + errorMessage);
+    }
+  };
+
+  const performOCRScan = async () => {
+    if (isProcessing) return;
+
+    setIsProcessing(true);
+    lastScanTimeRef.current = Date.now();
+    setDebugInfo('🔍 AI reading text...');
+
+    const screenshot = captureFrame();
+    if (!screenshot) {
+      setIsProcessing(false);
+      setDebugInfo('❌ Failed to capture image');
+      setTimeout(() => {
+        setDebugInfo('📸 OCR Mode - Tap to scan');
+      }, 2000);
+      return;
+    }
+
+    try {
+      const extractedText = await extractTextWithAI(screenshot);
+      
+      console.log('OCR Result:', extractedText); // Debug log
+      
+      if (extractedText && extractedText.trim() && extractedText !== 'NO_TEXT_FOUND') {
+        onScan({
+          text: extractedText
+        });
+        setDebugInfo('✅ Text extracted!');
+        setTimeout(() => {
+          setDebugInfo('📸 OCR Mode - Tap to scan');
+        }, 1500);
+      } else {
+        setDebugInfo('⚠️ No text detected - Point at clear text');
+        setTimeout(() => {
+          setDebugInfo('📸 OCR Mode - Tap to scan');
+        }, 2000);
+      }
+    } catch (err) {
+      console.error('OCR failed:', err);
+      setDebugInfo('❌ OCR failed - Try again');
+      setTimeout(() => {
+        setDebugInfo('📸 OCR Mode - Tap to scan');
+      }, 2000);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   const captureFrame = (): string | null => {
     if (!videoRef.current) return null;
 
@@ -256,7 +413,7 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
               content: [
                 {
                   type: 'text',
-                  text: 'Extract ALL readable text from this image, even if blurry, low quality, or partially visible. Look for: product names, brands, descriptions, labels, prices, ingredients, or ANY text near/around barcodes. Try your best to read imperfect, tilted, or low-resolution text. Return ONLY the extracted text. If truly nothing is readable, return empty string.'
+                  text: 'You are an expert OCR system. Extract ALL text visible in this image. Read everything - words, numbers, labels, signs, product names, brands, prices, dates, addresses, handwriting, printed text, etc. Even if text is blurry, tilted, small, faded, or partially obscured - do your best to read it. Format the output as plain text, preserving line breaks where appropriate. If you see NOTHING readable at all, return the text "NO_TEXT_FOUND".'
                 },
                 {
                   type: 'image_url',
@@ -283,6 +440,12 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       
       if (data.choices && data.choices[0]?.message?.content) {
         const text = data.choices[0].message.content.trim();
+        
+        // Check if AI found no text
+        if (text === 'NO_TEXT_FOUND' || text === '') {
+          return '';
+        }
+        
         return text;
       }
       
@@ -295,6 +458,10 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
 
   const toggleCamera = () => {
     setFacingMode(prev => prev === 'environment' ? 'user' : 'environment');
+  };
+
+  const toggleScanMode = () => {
+    setScanMode(prev => prev === 'barcode-ocr' ? 'ocr-only' : 'barcode-ocr');
   };
 
   return (
@@ -315,6 +482,14 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
           <div className="scan-line"></div>
         </div>
       </div>
+      <button 
+        className="mode-toggle-btn" 
+        onClick={toggleScanMode}
+        aria-label="Toggle scan mode"
+        title={scanMode === 'barcode-ocr' ? 'Switch to OCR Only' : 'Switch to Barcode + OCR'}
+      >
+        {scanMode === 'barcode-ocr' ? '📊' : '📝'}
+      </button>
       {availableCameras.length > 1 && (
         <button 
           className="camera-switch-btn" 
@@ -322,6 +497,16 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
           aria-label="Switch camera"
         >
           🔄
+        </button>
+      )}
+      {scanMode === 'ocr-only' && (
+        <button 
+          className="ocr-scan-btn" 
+          onClick={performOCRScan}
+          disabled={isProcessing}
+          aria-label="Scan text"
+        >
+          {isProcessing ? '⏳' : '📸'}
         </button>
       )}
       {error && (
@@ -332,6 +517,9 @@ export function BarcodeScanner({ onScan, videoRef }: BarcodeScannerProps) {
       <div className="debug-info">
         {isProcessing && <span className="processing-spinner">⏳ </span>}
         {debugInfo}
+      </div>
+      <div className="mode-indicator">
+        {scanMode === 'barcode-ocr' ? '📊 Barcode + OCR' : '📝 OCR Only'}
       </div>
     </div>
   );

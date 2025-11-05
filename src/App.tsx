@@ -48,9 +48,9 @@ function App() {
     <div className="app">
       <header className="app-header">
         <h1>🤖 AI Barcode Scanner</h1>
-        <p>Powered by OpenRouter AI Vision - Automatically detects barcodes & text</p>
+        <p>Powered by OpenRouter AI Vision - Barcode detection & OCR text extraction</p>
         <div className="instructions">
-          💡 Show any barcode to the camera - AI will extract everything in JSON format
+          � Barcode + OCR: Detect barcodes & extract text | 📝 OCR Only: Extract text without barcodes
         </div>
       </header>
 

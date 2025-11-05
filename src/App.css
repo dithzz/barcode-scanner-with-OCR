@@ -145,6 +145,88 @@ body {
   }
 }
 
+/* Mode Toggle Button */
+.mode-toggle-btn {
+  position: absolute;
+  top: 15px;
+  left: 15px;
+  background: rgba(102, 126, 234, 0.8);
+  backdrop-filter: blur(10px);
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  color: white;
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 1.5rem;
+  z-index: 10;
+  transition: all 0.3s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mode-toggle-btn:active {
+  transform: scale(0.9);
+  background: rgba(102, 126, 234, 1);
+}
+
+@media (min-width: 768px) {
+  .mode-toggle-btn:hover {
+    background: rgba(102, 126, 234, 1);
+    transform: scale(1.1);
+  }
+}
+
+/* OCR Scan Button */
+.ocr-scan-btn {
+  position: absolute;
+  bottom: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(102, 126, 234, 0.9);
+  backdrop-filter: blur(10px);
+  border: 3px solid rgba(255, 255, 255, 0.4);
+  color: white;
+  width: 70px;
+  height: 70px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 2rem;
+  z-index: 10;
+  transition: all 0.3s ease;
+  -webkit-tap-highlight-color: transparent;
+  box-shadow: 0 4px 20px rgba(102, 126, 234, 0.5);
+}
+
+.ocr-scan-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.ocr-scan-btn:active:not(:disabled) {
+  transform: translateX(-50%) scale(0.9);
+  background: rgba(102, 126, 234, 1);
+}
+
+@media (min-width: 768px) {
+  .ocr-scan-btn {
+    width: 80px;
+    height: 80px;
+    font-size: 2.5rem;
+  }
+  
+  .ocr-scan-btn:hover:not(:disabled) {
+    background: rgba(102, 126, 234, 1);
+    transform: translateX(-50%) scale(1.1);
+    box-shadow: 0 6px 30px rgba(102, 126, 234, 0.7);
+  }
+}
+
 /* OCR Controls */
 .ocr-controls {
   margin-bottom: 20px;
@@ -372,6 +454,31 @@ body {
     padding: 10px 20px;
     font-size: 0.9rem;
     max-width: 80%;
+  }
+}
+
+/* Mode Indicator */
+.mode-indicator {
+  position: absolute;
+  top: 15px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(102, 126, 234, 0.9);
+  backdrop-filter: blur(10px);
+  color: white;
+  padding: 6px 12px;
+  border-radius: 15px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  white-space: nowrap;
+  z-index: 9;
+  animation: fadeIn 0.3s ease-in-out;
+}
+
+@media (min-width: 768px) {
+  .mode-indicator {
+    padding: 8px 16px;
+    font-size: 0.85rem;
   }
 }
 
